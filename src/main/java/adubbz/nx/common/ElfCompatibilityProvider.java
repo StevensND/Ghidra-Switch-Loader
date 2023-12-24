@@ -9,6 +9,7 @@ package adubbz.nx.common;
 import adubbz.nx.util.FullMemoryByteProvider;
 import adubbz.nx.util.LegacyBinaryReader;
 import ghidra.app.util.bin.BinaryReader;
+import ghidra.app.util.bin.ByteArrayProvider;
 import ghidra.app.util.bin.ByteProvider;
 import ghidra.app.util.bin.format.elf.*;
 import ghidra.app.util.bin.format.elf.extend.ElfExtensionFactory;
@@ -21,6 +22,7 @@ import ghidra.util.Msg;
 import ghidra.util.exception.NotFoundException;
 
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.util.*;
 
 public class ElfCompatibilityProvider 
@@ -352,7 +354,8 @@ public class ElfCompatibilityProvider
         private HashMap<Integer, ElfDynamicType> dynamicTypeMap;
         
         public DummyElfHeader(boolean isAarch32) throws ElfException {
-            super(ByteProvider.EMPTY_BYTEPROVIDER, s -> {});
+            super(new ByteArrayProvider(Arrays.copyOf(ElfConstants.MAGIC_BYTES, ElfConstants.EI_NIDENT + 18)), s -> {});
+            this.undoSuperclassInit();
 
             this.isAarch32 = isAarch32;
             dynamicTypeMap = new HashMap<>();
@@ -365,8 +368,27 @@ public class ElfCompatibilityProvider
             }
         }
 
-        @Override
-        protected void initElfHeader() { }
+        private void undoSuperclassInit() {
+            // Map.of() does not allow null values
+            Map<String, Object> fieldFixes = Map.of(
+                    "provider", ByteProvider.EMPTY_BYTEPROVIDER,
+                    "reader", "NULL",
+                    "e_ident_magic_num", (byte)0,
+                    "e_ident_magic_str", "NULL",
+                    "e_ident_pad", "NULL",
+                    "hasLittleEndianHeaders", false
+            );
+
+            fieldFixes.forEach((fieldName, fixedValue) -> {
+                try {
+                    Field field = this.getClass().getSuperclass().getDeclaredField(fieldName);
+                    field.setAccessible(true);
+                    field.set(this, fixedValue.equals("NULL") ? null : fixedValue);
+                } catch (IllegalAccessException | NoSuchFieldException e) {
+                    Msg.warn(this, "Couldn't restore original value of field: " + fieldName, e);
+                }
+            });
+        }
 
         @Override
         protected HashMap<Integer, ElfDynamicType> getDynamicTypeMap()
