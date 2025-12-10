@@ -119,7 +119,8 @@ public class SwitchLoader extends BinaryLoader
         {
             if (!success) 
             {
-                prog.release(settings);
+                // Release the program with the consumer from settings
+                prog.release(settings.consumer());
             }
         }
 
