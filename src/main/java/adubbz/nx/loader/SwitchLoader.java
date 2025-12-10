@@ -25,6 +25,7 @@ import ghidra.app.util.bin.ByteProvider;
 import ghidra.app.util.bin.ByteProviderWrapper;
 import ghidra.app.util.importer.MessageLog;
 import ghidra.app.util.opinion.*;
+import ghidra.framework.model.DomainFolder;
 import ghidra.framework.model.Project;
 import ghidra.framework.store.LockException;
 import ghidra.program.model.address.Address;
@@ -40,7 +41,7 @@ import ghidra.util.Msg;
 import ghidra.util.exception.CancelledException;
 import ghidra.util.task.TaskMonitor;
 
-public class SwitchLoader extends BinaryLoader 
+public class SwitchLoader extends AbstractProgramLoader 
 {
     public static final String SWITCH_NAME = "Nintendo Switch Binary";
     public static final LanguageID AARCH64_LANGUAGE_ID = new LanguageID("AARCH64:LE:64:v8A");
@@ -97,8 +98,8 @@ public class SwitchLoader extends BinaryLoader
     }
 
     @Override
-    protected List<Loaded<Program>> loadProgram(ByteProvider provider, String programName, 
-            Project project, String programFolderPath, LoadSpec loadSpec, List<Option> options, 
+    protected List<Loaded<Program>> loadProgram(ByteProvider provider, String loadedName, 
+            Project project, String projectFolderPath, LoadSpec loadSpec, List<Option> options, 
             MessageLog log, Object consumer, TaskMonitor monitor) 
             throws IOException, CancelledException {
         
@@ -107,7 +108,7 @@ public class SwitchLoader extends BinaryLoader
         CompilerSpec importerCompilerSpec = importerLanguage.getCompilerSpecByID(pair.compilerSpecID);
 
         Address baseAddr = importerLanguage.getAddressFactory().getDefaultAddressSpace().getAddress(0);
-        Program prog = createProgram(provider, programName, baseAddr, getName(), 
+        Program prog = createProgram(provider, loadedName, baseAddr, getName(), 
                 importerLanguage, importerCompilerSpec, consumer);
         boolean success = false;
 
@@ -115,9 +116,9 @@ public class SwitchLoader extends BinaryLoader
 
         try 
         {
-            this.loadProgramInto(provider, loadSpec, options, log, prog, monitor);
+            loadProgramInto(provider, loadSpec, options, log, prog, monitor);
             success = true;
-            results = List.of(new Loaded<Program>(prog, programName, programFolderPath));
+            results = List.of(new Loaded<Program>(prog, loadedName, projectFolderPath));
         }
         finally 
         {
