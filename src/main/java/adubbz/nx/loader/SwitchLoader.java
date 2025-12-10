@@ -96,9 +96,9 @@ public class SwitchLoader extends AbstractLibrarySupportLoader
     protected void load(Program program, ImporterSettings settings)
             throws IOException, CancelledException {
         
-        var provider = settings.getByteProvider();
-        var monitor = settings.getTaskMonitor();
-        var log = settings.getMessageLog();
+        var provider = settings.getProvider();
+        var monitor = settings.getMonitor();
+        var log = settings.getLog();
         var space = program.getAddressFactory().getDefaultAddressSpace();
         
         // Handle SX_KIP1 special case - skip first 0x10 bytes
