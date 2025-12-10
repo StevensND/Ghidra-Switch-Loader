@@ -25,15 +25,10 @@ import ghidra.app.util.bin.ByteProvider;
 import ghidra.app.util.bin.ByteProviderWrapper;
 import ghidra.app.util.importer.MessageLog;
 import ghidra.app.util.opinion.*;
-import ghidra.framework.model.DomainFolder;
-import ghidra.framework.model.Project;
 import ghidra.framework.store.LockException;
-import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressOutOfBoundsException;
 import ghidra.program.model.address.AddressOverflowException;
-import ghidra.program.model.lang.CompilerSpec;
 import ghidra.program.model.lang.CompilerSpecID;
-import ghidra.program.model.lang.Language;
 import ghidra.program.model.lang.LanguageCompilerSpecPair;
 import ghidra.program.model.lang.LanguageID;
 import ghidra.program.model.listing.Program;
@@ -41,7 +36,7 @@ import ghidra.util.Msg;
 import ghidra.util.exception.CancelledException;
 import ghidra.util.task.TaskMonitor;
 
-public class SwitchLoader extends AbstractProgramLoader 
+public class SwitchLoader extends AbstractLibrarySupportLoader 
 {
     public static final String SWITCH_NAME = "Nintendo Switch Binary";
     public static final LanguageID AARCH64_LANGUAGE_ID = new LanguageID("AARCH64:LE:64:v8A");
@@ -98,46 +93,13 @@ public class SwitchLoader extends AbstractProgramLoader
     }
 
     @Override
-    protected List<Loaded<Program>> loadProgram(ByteProvider provider, String loadedName, 
-            Project project, String projectFolderPath, LoadSpec loadSpec, List<Option> options, 
-            MessageLog log, Object consumer, TaskMonitor monitor) 
-            throws IOException, CancelledException {
-        
-        LanguageCompilerSpecPair pair = loadSpec.getLanguageCompilerSpec();
-        Language importerLanguage = getLanguageService().getLanguage(pair.languageID);
-        CompilerSpec importerCompilerSpec = importerLanguage.getCompilerSpecByID(pair.compilerSpecID);
-
-        Address baseAddr = importerLanguage.getAddressFactory().getDefaultAddressSpace().getAddress(0);
-        Program prog = createProgram(provider, loadedName, baseAddr, getName(), 
-                importerLanguage, importerCompilerSpec, consumer);
-        boolean success = false;
-
-        List<Loaded<Program>> results;
-
-        try 
-        {
-            loadProgramInto(provider, loadSpec, options, log, prog, monitor);
-            success = true;
-            results = List.of(new Loaded<Program>(prog, loadedName, projectFolderPath));
-        }
-        finally 
-        {
-            if (!success) 
-            {
-                prog.release(consumer);
-            }
-        }
-
-        return results;
-    }
-
-    @Override
-    protected void loadProgramInto(ByteProvider provider, LoadSpec loadSpec, List<Option> options, 
-            MessageLog log, Program program, TaskMonitor monitor) 
-            throws IOException, CancelledException {
+    protected void load(ByteProvider provider, LoadSpec loadSpec, List<Option> options,
+            Program program, TaskMonitor monitor, MessageLog log)
+            throws CancelledException, IOException {
         
         var space = program.getAddressFactory().getDefaultAddressSpace();
         
+        // Handle SX_KIP1 special case - skip first 0x10 bytes
         if (this.binaryType == BinaryType.SX_KIP1)
         {
             provider = new ByteProviderWrapper(provider, 0x10, provider.length() - 0x10);
@@ -162,9 +124,11 @@ public class SwitchLoader extends AbstractProgramLoader
             Msg.error(this, "Failed to set image base", e);
         }
 
+        // Load the program using the NXProgramBuilder
         var loader = new NXProgramBuilder(program, provider, adapter);
         loader.load(monitor);
         
+        // Create entry function for KIP1
         if (this.binaryType == BinaryType.KIP1)
         {
             // KIP1s always start with a branch instruction at the start of their text
