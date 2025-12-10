@@ -93,10 +93,12 @@ public class SwitchLoader extends AbstractLibrarySupportLoader
     }
 
     @Override
-    protected void load(ByteProvider provider, LoadSpec loadSpec, List<Option> options,
-            Program program, TaskMonitor monitor, MessageLog log)
-            throws CancelledException, IOException {
+    protected void load(Program program, ImporterSettings settings)
+            throws IOException, CancelledException {
         
+        var provider = settings.getByteProvider();
+        var monitor = settings.getTaskMonitor();
+        var log = settings.getMessageLog();
         var space = program.getAddressFactory().getDefaultAddressSpace();
         
         // Handle SX_KIP1 special case - skip first 0x10 bytes
