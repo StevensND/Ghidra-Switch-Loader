@@ -25,10 +25,14 @@ import ghidra.app.util.bin.ByteProvider;
 import ghidra.app.util.bin.ByteProviderWrapper;
 import ghidra.app.util.importer.MessageLog;
 import ghidra.app.util.opinion.*;
+import ghidra.framework.model.Project;
 import ghidra.framework.store.LockException;
+import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressOutOfBoundsException;
 import ghidra.program.model.address.AddressOverflowException;
+import ghidra.program.model.lang.CompilerSpec;
 import ghidra.program.model.lang.CompilerSpecID;
+import ghidra.program.model.lang.Language;
 import ghidra.program.model.lang.LanguageCompilerSpecPair;
 import ghidra.program.model.lang.LanguageID;
 import ghidra.program.model.listing.Program;
@@ -36,7 +40,7 @@ import ghidra.util.Msg;
 import ghidra.util.exception.CancelledException;
 import ghidra.util.task.TaskMonitor;
 
-public class SwitchLoader extends AbstractLibrarySupportLoader 
+public class SwitchLoader extends BinaryLoader 
 {
     public static final String SWITCH_NAME = "Nintendo Switch Binary";
     public static final LanguageID AARCH64_LANGUAGE_ID = new LanguageID("AARCH64:LE:64:v8A");
@@ -93,16 +97,40 @@ public class SwitchLoader extends AbstractLibrarySupportLoader
     }
 
     @Override
-    protected void load(Program program, ImporterSettings settings)
-            throws IOException, CancelledException {
-        
-        // ImporterSettings has public fields, not getters
-        var provider = settings.provider;
-        var monitor = settings.monitor;
-        var log = settings.log;
+    protected List<Loaded<Program>> loadProgram(ImporterSettings settings) throws IOException, CancelledException {
+        LoadSpec loadSpec = settings.loadSpec();
+        LanguageCompilerSpecPair pair = loadSpec.getLanguageCompilerSpec();
+        Language importerLanguage = getLanguageService().getLanguage(pair.languageID);
+        CompilerSpec importerCompilerSpec = importerLanguage.getCompilerSpecByID(pair.compilerSpecID);
+
+        Address baseAddr = importerLanguage.getAddressFactory().getDefaultAddressSpace().getAddress(0);
+        Program prog = createProgram(settings);
+        boolean success = false;
+
+        List<Loaded<Program>> results;
+
+        try 
+        {
+            this.loadProgramInto(prog, settings);
+            success = true;
+            results = List.of(new Loaded<Program>(prog, settings));
+        }
+        finally 
+        {
+            if (!success) 
+            {
+                prog.release(settings);
+            }
+        }
+
+        return results;
+    }
+
+    @Override
+    protected void loadProgramInto(Program program, ImporterSettings settings) throws IOException, CancelledException {
         var space = program.getAddressFactory().getDefaultAddressSpace();
+        var provider = settings.provider();
         
-        // Handle SX_KIP1 special case - skip first 0x10 bytes
         if (this.binaryType == BinaryType.SX_KIP1)
         {
             provider = new ByteProviderWrapper(provider, 0x10, provider.length() - 0x10);
@@ -127,15 +155,13 @@ public class SwitchLoader extends AbstractLibrarySupportLoader
             Msg.error(this, "Failed to set image base", e);
         }
 
-        // Load the program using the NXProgramBuilder
         var loader = new NXProgramBuilder(program, provider, adapter);
-        loader.load(monitor);
+        loader.load(settings.monitor());
         
-        // Create entry function for KIP1
         if (this.binaryType == BinaryType.KIP1)
         {
             // KIP1s always start with a branch instruction at the start of their text
-            loader.createEntryFunction("entry", program.getImageBase().getOffset(), monitor);
+            loader.createEntryFunction("entry", program.getImageBase().getOffset(), settings.monitor());
         }
     }
 
