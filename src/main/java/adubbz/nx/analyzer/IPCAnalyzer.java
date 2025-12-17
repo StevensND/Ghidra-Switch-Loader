@@ -717,24 +717,18 @@ public class IPCAnalyzer extends AbstractAnalyzer
         return gotDataSyms;
     }
     
-public static String demangleIpcSymbol(String mangled)
-{
-    // Needed by the demangler
-    if (!mangled.startsWith("_Z"))
-        mangled = "_Z" + mangled;
- 
-    String out = mangled;
-    
-    try {
-        // Use the new API: demangle(Program, String, Address)
-        // Pass null for Program and Address since we're in a static method
-        // This returns a List<DemangledObject>
-        List<DemangledObject> demangledObjects = DemanglerUtil.demangle(null, mangled, null);
+    public static String demangleIpcSymbol(String mangled)
+    {
+        // Needed by the demangler
+        if (!mangled.startsWith("_Z"))
+            mangled = "_Z" + mangled;
+     
+        String out = mangled;
+        DemangledObject demangledObj = DemanglerUtil.demangle(mangled);
         
-        // Use the first result if available
-        if (demangledObjects != null && !demangledObjects.isEmpty())
+        // Where possible, replace the mangled symbol with a demangled one
+        if (demangledObj != null)
         {
-            DemangledObject demangledObj = demangledObjects.get(0);
             StringBuilder builder = new StringBuilder(demangledObj.toString());
             int templateLevel = 0;
             
@@ -757,14 +751,10 @@ public static String demangleIpcSymbol(String mangled)
             }
             
             out = builder.toString();
-        }
-    } catch (Exception e) {
-        // If demangling fails, just return the mangled name
-        // This prevents crashes if the demangler encounters unexpected input
+        }            
+        
+        return out;
     }
-    
-    return out;
-}
     
     public static String shortenIpcSymbol(String longSym)
     {
