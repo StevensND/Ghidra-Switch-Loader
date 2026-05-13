@@ -41,8 +41,8 @@ import ghidra.util.Msg;
 import ghidra.util.exception.InvalidInputException;
 import ghidra.util.task.TaskMonitor;
 import org.apache.commons.compress.utils.Lists;
-import org.python.google.common.collect.HashBiMap;
-import org.python.google.common.collect.Sets;
+import com.google.common.collect.HashBiMap;
+import com.google.common.collect.Sets;
 
 import java.io.IOException;
 import java.util.*;
