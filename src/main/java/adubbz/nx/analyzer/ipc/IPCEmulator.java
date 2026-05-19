@@ -35,12 +35,32 @@ import ghidra.util.task.TaskMonitorAdapter;
 import org.apache.commons.compress.utils.Lists;
 
 import java.nio.ByteBuffer;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
 public class IPCEmulator 
 {
+    private static final int MAX_BUFFER_ATTRS = 8;
+    private static final int BUFFER_ATTR_IN = IPCTrace.BUFFER_ATTR_IN;
+    private static final int BUFFER_ATTR_OUT = IPCTrace.BUFFER_ATTR_OUT;
+    private static final int BUFFER_ATTR_HIPC_MAP_ALIAS = 4;
+    private static final int BUFFER_ATTR_HIPC_POINTER = 8;
+    private static final int BUFFER_ATTR_HIPC_AUTO_SELECT = 32;
+    private static final int BUFFER_ATTR_HIPC_MAP_TRANSFER_ALLOWS_NON_SECURE = 64;
+    private static final int BUFFER_ATTR_HIPC_MAP_TRANSFER_ALLOWS_NON_DEVICE = 128;
+    private static final int BUFFER_ATTR_VALID_MASK =
+        BUFFER_ATTR_IN |
+        BUFFER_ATTR_OUT |
+        BUFFER_ATTR_HIPC_MAP_ALIAS |
+        BUFFER_ATTR_HIPC_POINTER |
+        16 |
+        BUFFER_ATTR_HIPC_AUTO_SELECT |
+        BUFFER_ATTR_HIPC_MAP_TRANSFER_ALLOWS_NON_SECURE |
+        BUFFER_ATTR_HIPC_MAP_TRANSFER_ALLOWS_NON_DEVICE;
+
     private Program program;
     public boolean hasSetup;
     
@@ -231,7 +251,7 @@ public class IPCEmulator
         // returned objects. This tries to brute-force until we find an
         // input that passes that validation.
 
-        int[] bufferSizes = new int[] { 128, 33, 1 };
+        int[] bufferSizes = new int[] { 0x300, 128, 33, 1 };
         ByteBuffer nonZeroBuf = ByteBuffer.allocate(0x8 * 6);
         
         for (int i = 0; i < 6; i++) nonZeroBuf.putLong(1);
@@ -277,65 +297,88 @@ public class IPCEmulator
     {
         if (!this.hasSetup)
             return null;
-        
-        // We allocate a fixed 0x1000 for the buffer. Therefore we only allow adjustments to less than or equal
-        // to that.
+
         if (bufferSize < 0 || bufferSize > 0x1000)
             throw new RuntimeException("Invalid buffer size provided");
-        
+
         this.bufferSize = bufferSize;
-        
-        this.instructionHandlers.clear(); // Clear any existing instruction handlers
+        this.instructionHandlers.clear();
         this.currentTrace = new IPCTrace(cmd, procFuncAddr.getOffset());
-        
-        // Clear out any existing IPC message data
+
         byte[] zeros = new byte[(int)this.messageSize];
         this.state.setChunk(zeros, this.sLang.getDefaultSpace(), this.messagePtr, zeros.length);
-        
-        this.setLong(messagePtr, 0x49434653); // IPC Magic
-        this.setLong(messagePtr + 0x8, cmd); // Cmd ID
-        
+
+        this.setLong(messagePtr, 0x49434653);
+        this.setLong(messagePtr + 0x8, cmd);
+
         if (data != null && data.length > 0)
             this.state.setChunk(data, this.sLang.getDefaultSpace(), this.messagePtr + 0x10, data.length);
-        
-        // Set registers to point to our objects.
-        // We need to do this each time to reset the state
+
         this.state.setValue("x0", this.targetObjectPtr);
         this.state.setValue("x1", this.ipcObjectPtr);
         this.state.setValue("x2", this.messageStructPtr);
-        
-        // Set to the start of the process function
+
         emu.setExecuteAddress(procFuncAddr);
-        
-        // Disassemble the proc function so we can get instructions from it
         disassembler.disassemble(procFuncAddr, null);
-        
+
+        final int MAX_INSTRUCTIONS_WITH_META = 100_000;
+        final int MAX_INSTRUCTIONS_NO_META   = 5_000;
+        final int MAX_NO_META_PC_HITS        = 256;
+        int instructionCount = 0;
+        Map<Long, Integer> noMetaPcHits = new HashMap<>();
+
         while (true)
         {
+            boolean hasMeta = this.currentTrace.bytesIn != -1;
+            int limit = hasMeta ? MAX_INSTRUCTIONS_WITH_META : MAX_INSTRUCTIONS_NO_META;
             long pc = state.getValue("pc");
-            Address pcAddr = this.sLang.getDefaultSpace().getAddress(pc);
-            
-            // Pre-process instructions
+
             for (Consumer<Long> instructionHandler : this.instructionHandlers)
-            {
                 instructionHandler.accept(pc);
-            }
-            
+
             if (emu.getExecuteAddress().getOffset() == 0)
+                break;
+
+            if (!hasMeta)
             {
+                int pcHits = noMetaPcHits.getOrDefault(pc, 0) + 1;
+                noMetaPcHits.put(pc, pcHits);
+
+                if (pcHits > MAX_NO_META_PC_HITS)
+                {
+                    this.currentTrace.timedOut = true;
+                    break;
+                }
+            }
+
+            if (++instructionCount > limit)
+            {
+                this.currentTrace.timedOut = true;
+
+                if (!hasMeta)
+                {
+                    // Silent — this is just a command that doesn't exist in this interface
+                }
+                else
+                {
+                    Msg.warn(this, String.format(
+                        "Emulation exceeded %d instructions for proc_func 0x%X cmd %d, aborting",
+                        limit, procFuncAddr.getOffset(), cmd));
+                }
                 break;
             }
-                
-            try 
+
+            try
             {
                 emu.executeInstruction(true, TaskMonitor.DUMMY);
-            } 
-            catch (CancelledException | LowlevelError e) 
+            }
+            catch (CancelledException | LowlevelError e)
             {
                 e.printStackTrace();
+                break; // also break on error rather than silently continuing
             }
         }
-        
+
         return this.currentTrace;
     }
     
@@ -450,90 +493,426 @@ public class IPCEmulator
         long metaInfoPtr = this.state.getValue("x1");
         long metaInfoSize = 0x90;
         byte[] metaInfo = new byte[(int)metaInfoSize];
-        
+
         if (metaInfoSize != this.state.getChunk(metaInfo, this.sLang.getDefaultSpace(), metaInfoPtr, metaInfo.length, true))
             throw new RuntimeException("Failed to read meta info");
-        
-        BinaryReader reader = new BinaryReader(new ByteArrayProvider(metaInfo), true);
-        
+
         try
         {
-            this.currentTrace.bytesIn = reader.readInt(0x8) - 0x10;
-            this.currentTrace.bytesOut = reader.readInt(0x10) - 0x10;
-            this.currentTrace.bufferCount = reader.readInt(0x18);
-            this.currentTrace.inInterfaces = reader.readInt(0x1C);
-            this.currentTrace.outInterfaces = reader.readInt(0x20);
-            this.currentTrace.inHandles = reader.readInt(0x24);
-            this.currentTrace.outHandles = reader.readInt(0x28);
-            
-            if (this.currentTrace.bytesIn < 0 || this.currentTrace.bytesIn > 0x1000L)
-                throw new RuntimeException("Invalid value for bytesIn!");
-            
-            if (this.currentTrace.bytesOut < 0 || this.currentTrace.bytesOut > 0x1000L)
-                throw new RuntimeException("Invalid value for bytesOut!");
-            
-            if (this.currentTrace.bufferCount > 20)
-                throw new RuntimeException("Too many buffers!");
-            
-            if (this.currentTrace.inInterfaces > 20)
-                throw new RuntimeException("Too many in interfaces!");
-            
-            if (this.currentTrace.outInterfaces > 20)
-                throw new RuntimeException("Too many out interfaces!");
-            
-            if (this.currentTrace.inHandles > 20)
-                throw new RuntimeException("Too many in handles!");
-            
-            if (this.currentTrace.outHandles > 20)
-                throw new RuntimeException("Too many out handles!");
-            
-            this.currentTrace.lr = this.state.getValue("x30");
-            
-            if (this.currentTrace.inInterfaces > 0)
+            Metadata metadata = decodeMetadata(metaInfo);
+
+            if (metadata != null)
             {
-                // Add a handler to cheat the cmp x8, x9 that usually happens
-                this.instructionHandlers.add((off) -> 
+                this.currentTrace.bytesIn       = metadata.bytesIn;
+                this.currentTrace.bytesOut      = metadata.bytesOut;
+                this.currentTrace.bufferCount   = metadata.bufferCount;
+                this.currentTrace.bufferAttrs   = metadata.bufferAttrs;
+                this.currentTrace.bufferAttrsSource = metadata.bufferAttrsSource;
+                this.currentTrace.bufferAttrsProbe = metadata.bufferAttrsProbe;
+                this.currentTrace.inInterfaces  = metadata.inInterfaces;
+                this.currentTrace.outInterfaces = metadata.outInterfaces;
+                this.currentTrace.inHandles     = metadata.inHandles;
+                this.currentTrace.outHandles    = metadata.outHandles;
+                this.currentTrace.lr            = this.state.getValue("x30");
+
+                if (this.currentTrace.inInterfaces > 0)
                 {
-                    Address pcAddr = this.sLang.getDefaultSpace().getAddress(off);
-                    CodeManager codeManager = ((ProgramDB)this.program).getCodeManager();
-                    Instruction currentInstruction = codeManager.getInstructionAt(pcAddr);
-                    
-                    // Attempt to disassemble the instruction so we can try again
-                    if (currentInstruction == null)
+                    this.instructionHandlers.add((off) ->
                     {
-                        disassembler.disassemble(pcAddr, null);
-                        currentInstruction = codeManager.getInstructionAt(pcAddr);
-                    }
-                    
-                    if (currentInstruction != null)
-                    {
-                        InstructionPrototype prototype = currentInstruction.getPrototype();
-                        String mnemonic = prototype.getMnemonic(currentInstruction.getInstructionContext());
-                        
-                        if (mnemonic.equals("cmp") && currentInstruction.getOperandType(0) == OperandType.REGISTER && currentInstruction.getOperandType(1) == OperandType.REGISTER)
+                        Address pcAddr = this.sLang.getDefaultSpace().getAddress(off);
+                        CodeManager codeManager = ((ProgramDB)this.program).getCodeManager();
+                        Instruction currentInstruction = codeManager.getInstructionAt(pcAddr);
+
+                        if (currentInstruction == null)
                         {
-                            Register r0 = currentInstruction.getRegister(0);
-                            Register r1 = currentInstruction.getRegister(1);
-                            
-                            // Cheat time!
-                            if (r0.getName().equals("x8") && r1.getName().equals("x9"))
+                            disassembler.disassemble(pcAddr, null);
+                            currentInstruction = codeManager.getInstructionAt(pcAddr);
+                        }
+
+                        if (currentInstruction != null)
+                        {
+                            InstructionPrototype prototype = currentInstruction.getPrototype();
+                            String mnemonic = prototype.getMnemonic(currentInstruction.getInstructionContext());
+
+                            if (mnemonic.equals("cmp") &&
+                                currentInstruction.getOperandType(0) == OperandType.REGISTER &&
+                                currentInstruction.getOperandType(1) == OperandType.REGISTER)
                             {
-                                long x9 = this.state.getValue("x9");
-                                this.state.setValue("x8", x9);
-                                this.state.setValue("NZCV", 0b0100);
+                                Register r0 = currentInstruction.getRegister(0);
+                                Register r1 = currentInstruction.getRegister(1);
+
+                                if (r0.getName().equals("x8") && r1.getName().equals("x9"))
+                                {
+                                    long x9 = this.state.getValue("x9");
+                                    this.state.setValue("x8", x9);
+                                    this.state.setValue("NZCV", 0b0100);
+                                }
                             }
                         }
-                    }
-                });
+                    });
+                }
+
+                this.returnFromFunc(0);
+                return true;
             }
+
+            Msg.warn(this, String.format(
+                "PrepareForProcess: no valid layout found for cmd %d. metaInfo[0..0x30]: %s",
+                this.currentTrace.cmdId, bytesToHex(metaInfo, 0x30)));
+            return false;
         }
         catch (Exception e)
         {
+            Msg.error(this, "PrepareForProcess exception", e);
             return false;
         }
-        
-        this.returnFromFunc(0);
-        return true;
+    }
+
+    private static Metadata decodeMetadata(byte[] metaInfo)
+    {
+        Metadata metadata = decodeRuntimeMetadata(metaInfo);
+        if (metadata != null && looksLikeRuntimeMetadata(metaInfo))
+            return metadata;
+
+        metadata = decodeLegacyCompactMetadata(metaInfo, 0x00);
+        if (metadata != null)
+            return metadata;
+
+        int[] wideBases = new int[] { 0x08, 0x10, 0x18, 0x20 };
+        for (int base : wideBases)
+        {
+            metadata = decodeLegacyWideMetadata(metaInfo, base);
+            if (metadata != null)
+                return metadata;
+        }
+
+        return null;
+    }
+
+    private static Metadata decodeLegacyCompactMetadata(byte[] metaInfo, int base)
+    {
+        // Legacy Nintendo SDK-style metadata stores CMIF header-inclusive raw
+        // sizes followed by object/buffer/handle counts.
+        long rawBytesIn    = readU16LE(metaInfo, base + 0x00);
+        long rawBytesOut   = readU16LE(metaInfo, base + 0x02);
+        long inInterfaces  = metaInfo[base + 0x04] & 0xFFL;
+        long bufferCount   = metaInfo[base + 0x05] & 0xFFL;
+        long outInterfaces = metaInfo[base + 0x06] & 0xFFL;
+        long inHandles     = metaInfo[base + 0x07] & 0xFFL;
+        long outHandles    = metaInfo[base + 0x08] & 0xFFL;
+
+        if (!isValidLegacyMetadata(rawBytesIn, rawBytesOut, bufferCount, inInterfaces, outInterfaces, inHandles, outHandles))
+            return null;
+
+        BufferAttrsResult bufferAttrs = decodeCompactBufferAttrs(metaInfo, base, bufferCount);
+        String bufferAttrsProbe = bufferAttrs == null ? describeCompactBufferAttrProbes(metaInfo, base, bufferCount) : null;
+
+        return new Metadata(rawBytesIn - 0x10, rawBytesOut - 0x10, bufferCount, inInterfaces,
+            outInterfaces, inHandles, outHandles, bufferAttrs, bufferAttrsProbe);
+    }
+
+    private static Metadata decodeLegacyWideMetadata(byte[] metaInfo, int base)
+    {
+        long rawBytesIn    = readU32LE(metaInfo, base + 0x00);
+        long rawBytesOut   = readU32LE(metaInfo, base + 0x08);
+        long inInterfaces  = readU32LE(metaInfo, base + 0x10);
+        long bufferCount   = readU32LE(metaInfo, base + 0x14);
+        long outInterfaces = readU32LE(metaInfo, base + 0x18);
+        long inHandles     = readU32LE(metaInfo, base + 0x1C);
+        long outHandles    = readU32LE(metaInfo, base + 0x20);
+
+        if (!isValidLegacyMetadata(rawBytesIn, rawBytesOut, bufferCount, inInterfaces, outInterfaces, inHandles, outHandles))
+            return null;
+
+        BufferAttrsResult bufferAttrs = decodeWideBufferAttrs(metaInfo, base, bufferCount);
+        String bufferAttrsProbe = bufferAttrs == null ? describeWideBufferAttrProbes(metaInfo, base, bufferCount) : null;
+
+        return new Metadata(rawBytesIn - 0x10, rawBytesOut - 0x10, bufferCount, inInterfaces,
+            outInterfaces, inHandles, outHandles, bufferAttrs, bufferAttrsProbe);
+    }
+
+    private static Metadata decodeRuntimeMetadata(byte[] metaInfo)
+    {
+        // Atmosphere's ServerMessageRuntimeMetadata is an eight-byte POD:
+        // in data size, unaligned out data size, in/out header sizes, in/out object counts.
+        long bytesIn       = readU16LE(metaInfo, 0x00);
+        long bytesOut      = readU16LE(metaInfo, 0x02);
+        long inHeadersSize = metaInfo[0x04] & 0xFFL;
+        long outHeadersSize= metaInfo[0x05] & 0xFFL;
+        long inInterfaces  = metaInfo[0x06] & 0xFFL;
+        long outInterfaces = metaInfo[0x07] & 0xFFL;
+
+        if (bytesIn > 0x4000L || bytesOut > 0x4000L)
+            return null;
+        if (!isValidHeaderSize(inHeadersSize) || !isValidHeaderSize(outHeadersSize))
+            return null;
+        if (inInterfaces > 20 || outInterfaces > 20)
+            return null;
+
+        return new Metadata(bytesIn, bytesOut, 0, inInterfaces, outInterfaces, 0, 0, null, null);
+    }
+
+    private static BufferAttrsResult decodeCompactBufferAttrs(byte[] metaInfo, int base, long bufferCount)
+    {
+        int[] offsets = new int[] { base + 0x0A, base + 0x09, alignUp(base + 0x09, 4), base + 0x10 };
+
+        for (int offset : offsets)
+        {
+            int[] attrs = readByteBufferAttrs(metaInfo, offset, bufferCount);
+            if (attrs != null)
+                return new BufferAttrsResult(attrs, String.format("legacy-compact/u8+0x%X", offset - base));
+        }
+
+        return null;
+    }
+
+    private static String describeCompactBufferAttrProbes(byte[] metaInfo, int base, long bufferCount)
+    {
+        int[] offsets = new int[] { base + 0x0A, base + 0x09, alignUp(base + 0x09, 4), base + 0x10 };
+        StringBuilder out = new StringBuilder();
+
+        for (int offset : offsets)
+            appendProbe(out, String.format("u8+0x%X", offset - base), readRawByteAttrs(metaInfo, offset, bufferCount));
+
+        return out.toString();
+    }
+
+    private static BufferAttrsResult decodeWideBufferAttrs(byte[] metaInfo, int base, long bufferCount)
+    {
+        int[] offsets = new int[] { base + 0x24, alignUp(base + 0x24, 8), base + 0x30 };
+
+        for (int offset : offsets)
+        {
+            int[] attrs = readU32BufferAttrs(metaInfo, offset, bufferCount);
+            if (attrs != null)
+                return new BufferAttrsResult(attrs, String.format("legacy-wide/u32+0x%X", offset - base));
+        }
+
+        for (int offset : offsets)
+        {
+            int[] attrs = readByteBufferAttrs(metaInfo, offset, bufferCount);
+            if (attrs != null)
+                return new BufferAttrsResult(attrs, String.format("legacy-wide/u8+0x%X", offset - base));
+        }
+
+        return null;
+    }
+
+    private static String describeWideBufferAttrProbes(byte[] metaInfo, int base, long bufferCount)
+    {
+        int[] offsets = new int[] { base + 0x24, alignUp(base + 0x24, 8), base + 0x30 };
+        StringBuilder out = new StringBuilder();
+
+        for (int offset : offsets)
+            appendProbe(out, String.format("u32+0x%X", offset - base), readRawU32Attrs(metaInfo, offset, bufferCount));
+
+        for (int offset : offsets)
+            appendProbe(out, String.format("u8+0x%X", offset - base), readRawByteAttrs(metaInfo, offset, bufferCount));
+
+        return out.toString();
+    }
+
+    private static void appendProbe(StringBuilder out, String name, String value)
+    {
+        if (out.length() > 0)
+            out.append("; ");
+
+        out.append(name).append("=").append(value);
+    }
+
+    private static int[] readByteBufferAttrs(byte[] metaInfo, int offset, long bufferCount)
+    {
+        if (!isValidBufferAttrCount(bufferCount) || offset < 0 || offset + bufferCount > metaInfo.length)
+            return null;
+
+        int[] attrs = new int[(int)bufferCount];
+
+        for (int i = 0; i < attrs.length; i++)
+        {
+            attrs[i] = metaInfo[offset + i] & 0xFF;
+
+            if (!isValidBufferAttr(attrs[i]))
+                return null;
+        }
+
+        return attrs;
+    }
+
+    private static String readRawByteAttrs(byte[] metaInfo, int offset, long bufferCount)
+    {
+        if (!isValidBufferAttrCount(bufferCount) || offset < 0 || offset + bufferCount > metaInfo.length)
+            return "<range>";
+
+        StringBuilder out = new StringBuilder("[");
+
+        for (int i = 0; i < bufferCount; i++)
+        {
+            if (i > 0)
+                out.append(",");
+
+            out.append(metaInfo[offset + i] & 0xFF);
+        }
+
+        return out.append("]").toString();
+    }
+
+    private static int[] readU32BufferAttrs(byte[] metaInfo, int offset, long bufferCount)
+    {
+        if (!isValidBufferAttrCount(bufferCount) || offset < 0 || offset + bufferCount * 4 > metaInfo.length)
+            return null;
+
+        int[] attrs = new int[(int)bufferCount];
+
+        for (int i = 0; i < attrs.length; i++)
+        {
+            long attr = readU32LE(metaInfo, offset + i * 4);
+
+            if (!isValidBufferAttr(attr))
+                return null;
+
+            attrs[i] = (int)attr;
+        }
+
+        return attrs;
+    }
+
+    private static String readRawU32Attrs(byte[] metaInfo, int offset, long bufferCount)
+    {
+        if (!isValidBufferAttrCount(bufferCount) || offset < 0 || offset + bufferCount * 4 > metaInfo.length)
+            return "<range>";
+
+        StringBuilder out = new StringBuilder("[");
+
+        for (int i = 0; i < bufferCount; i++)
+        {
+            if (i > 0)
+                out.append(",");
+
+            out.append(readU32LE(metaInfo, offset + i * 4));
+        }
+
+        return out.append("]").toString();
+    }
+
+    private static boolean isValidBufferAttrCount(long bufferCount)
+    {
+        return bufferCount > 0 && bufferCount <= MAX_BUFFER_ATTRS;
+    }
+
+    private static boolean isValidBufferAttr(long attr)
+    {
+        if (attr <= 0 || (attr & ~BUFFER_ATTR_VALID_MASK) != 0)
+            return false;
+
+        if ((attr & (BUFFER_ATTR_IN | BUFFER_ATTR_OUT)) == 0)
+            return false;
+
+        int transferModes = 0;
+
+        if ((attr & BUFFER_ATTR_HIPC_MAP_ALIAS) != 0) transferModes++;
+        if ((attr & BUFFER_ATTR_HIPC_POINTER) != 0) transferModes++;
+        if ((attr & BUFFER_ATTR_HIPC_AUTO_SELECT) != 0) transferModes++;
+
+        if (transferModes != 1)
+            return false;
+
+        return (attr & (BUFFER_ATTR_HIPC_MAP_TRANSFER_ALLOWS_NON_SECURE |
+            BUFFER_ATTR_HIPC_MAP_TRANSFER_ALLOWS_NON_DEVICE)) !=
+            (BUFFER_ATTR_HIPC_MAP_TRANSFER_ALLOWS_NON_SECURE |
+                BUFFER_ATTR_HIPC_MAP_TRANSFER_ALLOWS_NON_DEVICE);
+    }
+
+    private static int alignUp(int value, int align)
+    {
+        return (value + align - 1) & -align;
+    }
+
+    private static class BufferAttrsResult
+    {
+        private final int[] attrs;
+        private final String source;
+
+        private BufferAttrsResult(int[] attrs, String source)
+        {
+            this.attrs = attrs;
+            this.source = source;
+        }
+    }
+
+    private static boolean isValidLegacyMetadata(long rawBytesIn, long rawBytesOut, long bufferCount,
+                                                 long inInterfaces, long outInterfaces,
+                                                 long inHandles, long outHandles)
+    {
+        if (rawBytesIn  < 0x10 || rawBytesIn  > 0x4010L) return false;
+        if (rawBytesOut < 0x10 || rawBytesOut > 0x4010L) return false;
+        if (bufferCount  > 20) return false;
+        if (inInterfaces > 20) return false;
+        if (outInterfaces> 20) return false;
+        if (inHandles    > 20) return false;
+        return outHandles <= 20;
+    }
+
+    private static boolean isValidHeaderSize(long size)
+    {
+        return size == 0 || size == 0x10 || size == 0x20 || size == 0x30;
+    }
+
+    private static boolean looksLikeRuntimeMetadata(byte[] metaInfo)
+    {
+        return isValidHeaderSize(metaInfo[0x04] & 0xFFL) &&
+            isValidHeaderSize(metaInfo[0x05] & 0xFFL) &&
+            ((metaInfo[0x04] & 0xFFL) >= 0x10 || (metaInfo[0x05] & 0xFFL) >= 0x10);
+    }
+
+    private static class Metadata
+    {
+        private final long bytesIn;
+        private final long bytesOut;
+        private final long bufferCount;
+        private final int[] bufferAttrs;
+        private final String bufferAttrsSource;
+        private final String bufferAttrsProbe;
+        private final long inInterfaces;
+        private final long outInterfaces;
+        private final long inHandles;
+        private final long outHandles;
+
+        private Metadata(long bytesIn, long bytesOut, long bufferCount, long inInterfaces,
+                         long outInterfaces, long inHandles, long outHandles,
+                         BufferAttrsResult bufferAttrs, String bufferAttrsProbe)
+        {
+            this.bytesIn = bytesIn;
+            this.bytesOut = bytesOut;
+            this.bufferCount = bufferCount;
+            this.bufferAttrs = bufferAttrs != null ? bufferAttrs.attrs : null;
+            this.bufferAttrsSource = bufferAttrs != null ? bufferAttrs.source : null;
+            this.bufferAttrsProbe = bufferAttrsProbe;
+            this.inInterfaces = inInterfaces;
+            this.outInterfaces = outInterfaces;
+            this.inHandles = inHandles;
+            this.outHandles = outHandles;
+        }
+    }
+
+    private static long readU16LE(byte[] buf, int off)
+    {
+        return ((buf[off] & 0xFFL)) | ((buf[off + 1] & 0xFFL) << 8);
+    }
+
+    private static long readU32LE(byte[] buf, int off)
+    {
+        return ((buf[off]     & 0xFFL))
+            | ((buf[off + 1] & 0xFFL) << 8)
+            | ((buf[off + 2] & 0xFFL) << 16)
+            | ((buf[off + 3] & 0xFFL) << 24);
+    }
+
+    private static String bytesToHex(byte[] bytes, int len)
+    {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < Math.min(len, bytes.length); i++)
+            sb.append(String.format("%02X ", bytes[i]));
+        return sb.toString().trim();
     }
     
     private boolean OverwriteClientProcessId()
@@ -547,8 +926,9 @@ public class IPCEmulator
     private boolean GetBuffers()
     {
         long out = this.state.getValue("x1");
+        long bufferCount = Math.max(this.currentTrace.bufferCount, 0);
         
-        for (long i = out; i < out + this.currentTrace.bufferCount * 0x10; i += 0x10)
+        for (long i = out; i < out + bufferCount * 0x10; i += 0x10)
         {
             this.setLong(i, this.bufferMemory);
             this.setLong(i + 0x8, this.bufferSize);
@@ -560,6 +940,12 @@ public class IPCEmulator
     
     private boolean GetInNativeHandles()
     {
+        long out = this.state.getValue("x1");
+        long handleCount = Math.max(this.currentTrace.inHandles, 0);
+
+        for (long i = 0; i < handleCount; i++)
+            this.setInt(out + i * 0x4, 0xCAFE0000L + i);
+
         this.returnFromFunc(0);
         return true;
     }
@@ -568,10 +954,16 @@ public class IPCEmulator
     {
         long out = this.state.getValue("x1");
         
-        if (this.currentTrace.inInterfaces != 1)
-            throw new RuntimeException("Invalid number of in interfaces!");
-            
-        this.setLong(out, this.inObjectPtr);
+        // Set up input object pointers for all in interfaces
+        // If there are 0 interfaces, we don't set anything
+        // If there are 1+ interfaces, fill them with the mock object
+        if (this.currentTrace.inInterfaces > 0)
+        {
+            for (long i = 0; i < this.currentTrace.inInterfaces; i++)
+            {
+                this.setLong(out + i * 0x8, this.inObjectPtr);
+            }
+        }
         
         this.returnFromFunc(0);
         return true;
@@ -594,8 +986,8 @@ public class IPCEmulator
     
     private boolean SetOutObjects()
     {
-        // Stubbed
-        return false;
+        this.returnFromFunc(0);
+        return true;
     }
     
     private boolean SetOutNativeHandles()
@@ -606,14 +998,16 @@ public class IPCEmulator
     
     private boolean BeginPreparingForErrorReply()
     {
-        // Stubbed
-        return false;
+        long off = this.state.getValue("x1");
+        this.setLong(off, this.outputMemory);
+        this.setLong(off + 0x8, 0x1000);
+        this.returnFromFunc(0);
+        return true;
     }
     
     private boolean EndPreparingForReply()
     {
-        // Stubbed
         this.returnFromFunc(0);
-        return false;
+        return true;
     }
 }
