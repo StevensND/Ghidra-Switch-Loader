@@ -19,10 +19,14 @@ import adubbz.nx.loader.knx.KNXAdapter;
 import adubbz.nx.loader.nro0.NRO0Adapter;
 import adubbz.nx.loader.nso0.NSO0Adapter;
 import adubbz.nx.loader.nxo.NXOAdapter;
+import adubbz.nx.common.ZbicException;
+import adubbz.nx.util.ZbicUtil;
 import ghidra.app.util.bin.BinaryReader;
+import ghidra.app.util.bin.ByteArrayProvider;
 import ghidra.app.util.bin.ByteProvider;
 import ghidra.app.util.bin.ByteProviderWrapper;
 import ghidra.app.util.opinion.*;
+import ghidra.framework.options.Options;
 import ghidra.framework.store.LockException;
 import ghidra.program.model.address.AddressOutOfBoundsException;
 import ghidra.program.model.address.AddressOverflowException;
@@ -40,10 +44,43 @@ public class SwitchLoader extends BinaryLoader
     public static final LanguageID AARCH32_LANGUAGE_ID = new LanguageID("ARM:LE:32:v8");
     private BinaryType binaryType;
 
+    /**
+     * If the provider begins with the ZBIC magic (a zstd variant Nintendo
+     * introduced in firmware 22.0.0+ for compressing whole ExeFS files -
+     * see {@link ZbicUtil}), transparently decompress the entire file and
+     * return a {@link ByteArrayProvider} over the resulting standard NSO0.
+     * Otherwise the original provider is returned unchanged.
+     */
+    private static ByteProvider maybeUnwrapZbic(ByteProvider provider) throws IOException
+    {
+        if (provider.length() < 4)
+            return provider;
+
+        byte[] head = provider.readBytes(0, 4);
+        if (!ZbicUtil.isZbicFrame(head))
+            return provider;
+
+        byte[] compressed = provider.readBytes(0, provider.length());
+
+        try
+        {
+            byte[] decompressed = ZbicUtil.decompress(compressed);
+            Msg.info(SwitchLoader.class, String.format(
+                "Unwrapped ZBIC frame: %d -> %d bytes", compressed.length, decompressed.length));
+            return new ByteArrayProvider(decompressed);
+        }
+        catch (ZbicException e)
+        {
+            Msg.error(SwitchLoader.class, "Failed to decompress ZBIC frame", e);
+            throw new IOException("Failed to decompress ZBIC frame: " + e.getMessage(), e);
+        }
+    }
+
     @Override
     public Collection<LoadSpec> findSupportedLoadSpecs(ByteProvider provider) throws IOException 
     {
         List<LoadSpec> loadSpecs = new ArrayList<>();
+        provider = maybeUnwrapZbic(provider);
         BinaryReader reader = new BinaryReader(provider, true);
         String magic_0x0 = reader.readAsciiString(0, 4);
         String magic_0x10 = reader.readAsciiString(0x10, 4);
@@ -93,14 +130,15 @@ public class SwitchLoader extends BinaryLoader
     protected void loadProgramInto(Program program, Loader.ImporterSettings settings) throws IOException, CancelledException
     {
         var space = program.getAddressFactory().getDefaultAddressSpace();
-        var provider = settings.provider();
+        var provider = maybeUnwrapZbic(settings.provider());
         
         if (this.binaryType == BinaryType.SX_KIP1)
         {
-            provider = new ByteProviderWrapper(settings.provider(), 0x10, settings.provider().length() - 0x10);
+            provider = new ByteProviderWrapper(provider, 0x10, provider.length() - 0x10);
         }
 
         var adapter = this.binaryType.createAdapter(program, provider);
+        this.setDefaultAnalysisOptions(program);
         
         // Set the base address
         try 
@@ -127,6 +165,14 @@ public class SwitchLoader extends BinaryLoader
             // KIP1s always start with a branch instruction at the start of their text
             loader.createEntryFunction("entry", program.getImageBase().getOffset(), settings.monitor());
         }
+    }
+
+    private void setDefaultAnalysisOptions(Program program)
+    {
+        Options analysisOptions = program.getOptions(Program.ANALYSIS_PROPERTIES);
+        analysisOptions.setBoolean("Decompiler Parameter ID", true);
+        analysisOptions.setBoolean("Scalar Operand References", true);
+        analysisOptions.setBoolean("ELF Scalar Operand References", true);
     }
 
     @Override

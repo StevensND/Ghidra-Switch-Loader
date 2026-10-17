@@ -114,4 +114,9 @@ public class NSO0Header
     {
         return this.bssSize;
     }
+
+    public boolean isZbic()
+    {
+        return (this.flags & 0x80L) != 0;
+    }
 }

@@ -60,6 +60,7 @@ def ghidraUserDir = System.getProperty("user.home") + "/.ghidra/.${DISTRO_PREFIX
 
 dependencies {
     implementation 'commons-primitives:commons-primitives:1.0'
+    implementation 'com.github.luben:zstd-jni:1.5.7-1'
     implementation group: 'at.yawk.lz4', name: 'lz4-java', version: '1.10.2'
     localDeps group: 'at.yawk.lz4', name: 'lz4-java', version: '1.10.2'
     implementation 'com.google.guava:guava:33.2.1-jre'

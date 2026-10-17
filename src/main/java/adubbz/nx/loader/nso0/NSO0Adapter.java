@@ -6,6 +6,9 @@
  */
 package adubbz.nx.loader.nso0;
 
+import adubbz.nx.util.ZbicUtil;
+import adubbz.nx.common.ZbicException;
+
 import java.io.IOException;
 
 import adubbz.nx.loader.nxo.MOD0Adapter;
@@ -43,71 +46,89 @@ public class NSO0Adapter extends MOD0Adapter
     private void read() throws IOException
     {
         this.nso0 = new NSO0Header(this.fileReader, 0x0);
-        
-        LZ4Factory factory = LZ4Factory.fastestInstance();
-        LZ4FastDecompressor decompressor = factory.fastDecompressor();
-        
-        NSO0SectionHeader textHeader = this.nso0.getSectionHeader(NXOSectionType.TEXT);
-        NSO0SectionHeader rodataHeader = this.nso0.getSectionHeader(NXOSectionType.RODATA);
-        NSO0SectionHeader dataHeader = this.nso0.getSectionHeader(NXOSectionType.DATA);
 
-        long textOffset = textHeader.getMemoryOffset();
+        LZ4Factory factory = LZ4Factory.fastestInstance();
+        LZ4FastDecompressor lz4 = factory.fastDecompressor();
+
+        NSO0SectionHeader textHeader  = this.nso0.getSectionHeader(NXOSectionType.TEXT);
+        NSO0SectionHeader rodataHeader = this.nso0.getSectionHeader(NXOSectionType.RODATA);
+        NSO0SectionHeader dataHeader  = this.nso0.getSectionHeader(NXOSectionType.DATA);
+
+        long textOffset  = textHeader.getMemoryOffset();
         long rodataOffset = rodataHeader.getMemoryOffset();
-        long dataOffset = dataHeader.getMemoryOffset();
-        long textSize = textHeader.getDecompressedSize();
-        long rodataSize = rodataHeader.getDecompressedSize();
-        long dataSize = dataHeader.getDecompressedSize();
-        
-        // The data section is last, so we use its offset + decompressed size
+        long dataOffset  = dataHeader.getMemoryOffset();
+        long textSize    = textHeader.getDecompressedSize();
+        long rodataSize  = rodataHeader.getDecompressedSize();
+        long dataSize    = dataHeader.getDecompressedSize();
+
         byte[] full = new byte[Math.toIntExact(dataOffset + dataSize)];
-        byte[] decompressedText;
-        byte[] decompressedRodata;
-        byte[] decompressedData;
-        
-        if (this.nso0.isSectionCompressed(NXOSectionType.TEXT))
-        {
-            byte[] compressedText = this.fileProvider.readBytes(this.nso0.getSectionFileOffset(NXOSectionType.TEXT), this.nso0.getCompressedSectionSize(NXOSectionType.TEXT));
-            decompressedText = new byte[Math.toIntExact(textSize)];
-            decompressor.decompress(compressedText, decompressedText);
-        }
-        else
-        {
-            decompressedText = this.fileProvider.readBytes(this.nso0.getSectionFileOffset(NXOSectionType.TEXT), textSize);
-        }
-        
-        System.arraycopy(decompressedText, 0, full, Math.toIntExact(textOffset), Math.toIntExact(textSize));
-        
-        if (this.nso0.isSectionCompressed(NXOSectionType.RODATA))
-        {
-            byte[] compressedRodata = this.fileProvider.readBytes(this.nso0.getSectionFileOffset(NXOSectionType.RODATA), this.nso0.getCompressedSectionSize(NXOSectionType.RODATA));
-            decompressedRodata = new byte[Math.toIntExact(rodataSize)];
-            decompressor.decompress(compressedRodata, decompressedRodata);
-        }
-        else
-        {
-            decompressedRodata = this.fileProvider.readBytes(this.nso0.getSectionFileOffset(NXOSectionType.RODATA), rodataSize);
-        }
-        
-        System.arraycopy(decompressedRodata, 0, full, Math.toIntExact(rodataOffset), Math.toIntExact(rodataSize));
-        
-        if (this.nso0.isSectionCompressed(NXOSectionType.DATA))
-        {
-            byte[] compressedData = this.fileProvider.readBytes(this.nso0.getSectionFileOffset(NXOSectionType.DATA), this.nso0.getCompressedSectionSize(NXOSectionType.DATA));
-            decompressedData = new byte[Math.toIntExact(dataSize)];
-            decompressor.decompress(compressedData, decompressedData);
-        }
-        else
-        {
-            decompressedData = this.fileProvider.readBytes(this.nso0.getSectionFileOffset(NXOSectionType.DATA), dataSize);
-        }
-        
-        System.arraycopy(decompressedData, 0, full, Math.toIntExact(dataOffset), Math.toIntExact(dataSize));
+
+        boolean isZbic = this.nso0.isZbic();
+
+        // TEXT
+        byte[] decompressedText = decompressSection(
+            NXOSectionType.TEXT, textSize, isZbic, lz4);
+        System.arraycopy(decompressedText, 0, full,
+            Math.toIntExact(textOffset), Math.toIntExact(textSize));
+
+        // RODATA
+        byte[] decompressedRodata = decompressSection(
+            NXOSectionType.RODATA, rodataSize, isZbic, lz4);
+        System.arraycopy(decompressedRodata, 0, full,
+            Math.toIntExact(rodataOffset), Math.toIntExact(rodataSize));
+
+        // DATA
+        byte[] decompressedData = decompressSection(
+            NXOSectionType.DATA, dataSize, isZbic, lz4);
+        System.arraycopy(decompressedData, 0, full,
+            Math.toIntExact(dataOffset), Math.toIntExact(dataSize));
+
         this.memoryProvider = new ByteArrayProvider(full);
-        
+
         this.sections = new NXOSection[3];
-        this.sections[NXOSectionType.TEXT.ordinal()] = new NXOSection(NXOSectionType.TEXT, textOffset, textSize);
+        this.sections[NXOSectionType.TEXT.ordinal()]   = new NXOSection(NXOSectionType.TEXT,   textOffset,  textSize);
         this.sections[NXOSectionType.RODATA.ordinal()] = new NXOSection(NXOSectionType.RODATA, rodataOffset, rodataSize);
-        this.sections[NXOSectionType.DATA.ordinal()] = new NXOSection(NXOSectionType.DATA, dataOffset, dataSize);
+        this.sections[NXOSectionType.DATA.ordinal()]   = new NXOSection(NXOSectionType.DATA,   dataOffset,  dataSize);
+    }
+
+    private byte[] decompressSection(NXOSectionType type, long decompSize,
+                                    boolean isZbic, LZ4FastDecompressor lz4)
+        throws IOException
+    {
+        if (!this.nso0.isSectionCompressed(type))
+        {
+            return this.fileProvider.readBytes(
+                this.nso0.getSectionFileOffset(type), decompSize);
+        }
+
+        byte[] compressed = this.fileProvider.readBytes(
+            this.nso0.getSectionFileOffset(type),
+            this.nso0.getCompressedSectionSize(type));
+
+        if (isZbic)
+        {
+            try
+            {
+                byte[] out = ZbicUtil.decompress(compressed);
+                if (out.length != decompSize)
+                {
+                    throw new IOException(String.format(
+                        "ZBIC %s size mismatch: got %d, expected %d",
+                        type, out.length, decompSize));
+                }
+                return out;
+            }
+            catch (ZbicException e)
+            {
+                throw new IOException("Failed to decompress ZBIC " + type + " section", e);
+            }
+        }
+        else
+        {
+            byte[] out = new byte[Math.toIntExact(decompSize)];
+            lz4.decompress(compressed, out);
+            return out;
+        }
     }
 
     @Override
